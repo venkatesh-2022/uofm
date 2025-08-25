@@ -1,0 +1,79 @@
+pipelines/templates/aks-helm-deploy.yaml
+# Minimal JFrog → AKS Helm deploy (Azure RBAC)
+parameters:
+  - name: azureSubscription      # ARM service connection name
+    type: string
+  - name: aksResourceGroup
+    type: string
+  - name: aksName
+    type: string
+  - name: agentPoolName          # self-hosted agent pool
+    type: string
+
+  - name: namespace              # already created
+    type: string
+  - name: releaseName
+    type: string
+  - name: chartPath              # repo-relative folder with Chart.yaml
+    type: string
+  - name: valuesFile             # repo-relative values file
+    type: string
+  - name: imageTag               # e.g., 1.0 or $(Build.BuildNumber)
+    type: string
+
+  - name: jfrogServer            # e.g., myjfrog.company.com (no scheme)
+    type: string
+  - name: jfrogPullSecretName
+    type: string
+    default: 'jfrog-pull'
+
+jobs:
+- job: Deploy
+  pool: { name: ${{ parameters.agentPoolName }} }
+  steps:
+  - checkout: self
+
+  - task: AzureCLI@2
+    displayName: 'Connect to AKS (Azure RBAC)'
+    inputs:
+      azureSubscription: ${{ parameters.azureSubscription }}
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+        az aks install-cli || true       # installs kubectl + kubelogin with recent az
+        az aks get-credentials -g "${{ parameters.aksResourceGroup }}" -n "${{ parameters.aksName }}" --overwrite-existing
+        kubelogin convert-kubeconfig -l azurecli
+        # sanity: check permission in the target namespace
+        kubectl auth can-i create deploy -n "${{ parameters.namespace }}"
+
+  - bash: |
+      set -euo pipefail
+      # Recreate/refresh imagePullSecret in the target namespace
+      kubectl -n "${{ parameters.namespace }}" delete secret "${{ parameters.jfrogPullSecretName }}" --ignore-not-found
+      kubectl -n "${{ parameters.namespace }}" create secret docker-registry "${{ parameters.jfrogPullSecretName }}" \
+        --docker-server="${{ parameters.jfrogServer }}" \
+        --docker-username="${JFROG_USER}" \
+        --docker-password="${JFROG_PASSWORD}"
+      kubectl -n "${{ parameters.namespace }}" get secret "${{ parameters.jfrogPullSecretName }}" -o jsonpath='{.type}'; echo
+    displayName: 'Create/Update JFrog imagePullSecret'
+    env:
+      JFROG_USER: $(JFROG_USER)           # define as secret variables in ADO
+      JFROG_PASSWORD: $(JFROG_PASSWORD)
+
+  - bash: |
+      set -euo pipefail
+      CHART="$(Build.SourcesDirectory)/${{ parameters.chartPath }}"
+      VALUES="$(Build.SourcesDirectory)/${{ parameters.valuesFile }}"
+      test -f "$CHART/Chart.yaml"
+      test -f "$VALUES"
+      helm version || (curl -fsSL https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash)
+
+      helm upgrade --install "${{ parameters.releaseName }}" "$CHART" \
+        -n "${{ parameters.namespace }}" -f "$VALUES" \
+        --set image.tag="${{ parameters.imageTag }}" \
+        --set imagePullSecrets[0].name="${{ parameters.jfrogPullSecretName }}" \
+        --wait --atomic --history-max 10 --timeout 5m
+
+      kubectl -n "${{ parameters.namespace }}" get deploy,svc,ingress -o wide
+    displayName: 'Helm upgrade/install'
