@@ -61,6 +61,37 @@ jobs:
       JFROG_USER: $(JFROG_USER)           # define as secret variables in ADO
       JFROG_PASSWORD: $(JFROG_PASSWORD)
 
+    # >>> Application Secret (Opaque) with your app config <<<
+  - bash: |
+      set -euo pipefail
+      SECRET_NAME="${{ parameters.appSecretName }}"
+      NS="${{ parameters.namespace }}"
+      KEYS='${{ parameters.appSecretKeys }}'
+
+      echo "Applying app Secret '$SECRET_NAME' in namespace '$NS'..."
+      TMP="$(mktemp)"
+      {
+        echo "apiVersion: v1"
+        echo "kind: Secret"
+        echo "metadata:"
+        echo "  name: ${SECRET_NAME}"
+        echo "  namespace: ${NS}"
+        echo "type: Opaque"
+        echo "stringData:"
+        for K in $KEYS; do
+          V="${!K:-}"
+          if [ -z "${V}" ]; then
+            echo "  # WARNING: $K is empty (variable not set)" 1>&2
+          fi
+          printf '  %s: "%s"\n' "$K" "$V"
+        done
+      } > "$TMP"
+
+      kubectl apply -f "$TMP"
+      rm -f "$TMP"
+    displayName: 'Create/Update application Secret'
+    # NOTE: we intentionally do not list env: mappings here so ANY pipeline/variable-group
+
   - bash: |
       set -euo pipefail
       CHART="$(Build.SourcesDirectory)/${{ parameters.chartPath }}"
